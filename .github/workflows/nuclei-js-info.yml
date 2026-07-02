@@ -14,36 +14,79 @@ jobs:
 
       - name: Install Nuclei
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y jq coreutils
+          sudo apt-get install -y jq coreutils findutils grep sed gawk
           go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
-      - name: Update Nuclei templates
+      - name: Update templates and show environment
         run: |
+          set -e
+          export PATH="$HOME/go/bin:$PATH"
+
+          nuclei -version
           nuclei -update-templates
+
+          echo "=== Template dirs ==="
+          ls -ld "$HOME/nuclei-templates" "$HOME/.local/nuclei-templates" 2>/dev/null || true
+
+          echo "=== Template count ==="
+          find "$HOME" -path '*nuclei-templates*' -name '*.yaml' | wc -l
 
       - name: Prepare JS URL chunks
         run: |
-          mkdir -p chunks results
+          set -e
+          mkdir -p chunks results logs debug
 
-          # clean file: remove empty lines, comments, spaces, duplicate URLs
-          grep -E '^https?://' js_final.txt \
+          echo "=== Current files ==="
+          ls -lah
+
+          if [ ! -f js_final.txt ]; then
+            echo "[-] js_final.txt not found in repo root"
+            exit 1
+          fi
+
+          echo "=== js_final.txt size ==="
+          ls -lh js_final.txt
+          wc -l js_final.txt || true
+
+          echo "=== First 20 lines from js_final.txt ==="
+          head -20 js_final.txt || true
+
+          # Extract URLs even if they are inside JSON, quotes, spaces, etc.
+          grep -Eo 'https?://[^"'\''<> )]+' js_final.txt \
             | sed 's/[[:space:]]//g' \
+            | sed 's/[,;]$//' \
+            | grep -Ei '\.m?js($|\?|#)' \
             | sort -u \
             > js_final_clean.txt
 
-          echo "[+] Total JS URLs:"
-          wc -l js_final_clean.txt
+          echo "=== Clean JS URLs count ==="
+          URL_COUNT=$(wc -l < js_final_clean.txt | tr -d ' ')
+          echo "$URL_COUNT"
 
-          # split every 1000 URLs into one chunk
-          split -l 1000 -d -a 4 js_final_clean.txt chunks/chunk_
+          echo "=== First 30 clean URLs ==="
+          head -30 js_final_clean.txt || true
 
-          echo "[+] Chunks:"
-          ls -lh chunks/
+          cp js_final_clean.txt debug/
+
+          if [ "$URL_COUNT" -eq 0 ]; then
+            echo "[-] No JS URLs extracted. Your js_final.txt format is not being parsed."
+            exit 1
+          fi
+
+          split -l 500 -d -a 5 js_final_clean.txt chunks/chunk_
+
+          echo "=== Chunks count ==="
+          find chunks -type f | wc -l
+
+          echo "=== Chunks preview ==="
+          ls -lh chunks | head -30
 
       - name: Run Nuclei on JS URLs in parallel
         run: |
+          set -e
           export PATH="$HOME/go/bin:$PATH"
 
           TPL="$HOME/nuclei-templates"
@@ -51,44 +94,77 @@ jobs:
             TPL="$HOME/.local/nuclei-templates"
           fi
 
+          echo "Using templates dir: $TPL"
+
           run_chunk() {
             chunk="$1"
             base="$(basename "$chunk")"
-            echo "[+] Running nuclei on $base"
+
+            echo "[+] Starting $base at $(date)"
+            echo "[+] URLs in $base: $(wc -l < "$chunk")"
 
             nuclei -l "$chunk" \
-              -t "$TPL/http/exposures/" \
-              -t "$TPL/http/misconfiguration/" \
-              -tags exposure,token,secret,secrets,config,disclosure,debug,env,api-key,apikey,credential,credentials \
+              -tags exposure,exposures,token,tokens,secret,secrets,config,configs,disclosure,debug,env,credential,credentials,apikey,api-key \
               -severity info,low,medium,high,critical \
-              -rl 50 \
-              -c 25 \
+              -rl 100 \
+              -c 50 \
               -retries 1 \
               -timeout 10 \
               -jsonl \
-              -silent \
               -nc \
-              -o "results/${base}.jsonl" || true
+              -o "results/${base}.jsonl" \
+              2>&1 | tee "logs/${base}.log"
+
+            echo "[+] Finished $base at $(date)"
+            echo "[+] Findings in $base:"
+            wc -l "results/${base}.jsonl" 2>/dev/null || true
           }
 
           export -f run_chunk
-          find chunks -type f | sort | xargs -P 6 -I{} bash -c 'run_chunk "$@"' _ {}
 
-      - name: Merge results
+          (
+            while true; do
+              echo "[heartbeat] still running at $(date)"
+              echo "[heartbeat] results so far:"
+              find results -type f -name '*.jsonl' -exec wc -l {} \; 2>/dev/null | tail -20 || true
+              sleep 60
+            done
+          ) &
+          HEARTBEAT_PID=$!
+
+          find chunks -type f | sort | xargs -P 8 -I{} bash -c 'run_chunk "$@"' _ {}
+
+          kill "$HEARTBEAT_PID" || true
+
+      - name: Merge and summarize results
         run: |
+          set -e
+          mkdir -p debug
+
           cat results/*.jsonl 2>/dev/null | sort -u > nuclei_js_info_results.jsonl || true
 
-          echo "[+] Total findings:"
+          echo "=== Final findings count ==="
           wc -l nuclei_js_info_results.jsonl || true
 
-          echo "[+] Preview:"
-          head -30 nuclei_js_info_results.jsonl || true
+          echo "=== Results preview ==="
+          head -50 nuclei_js_info_results.jsonl || true
 
-      - name: Upload results
+          echo "=== Logs preview ==="
+          find logs -type f | head -10 | while read f; do
+            echo "----- $f -----"
+            head -80 "$f" || true
+          done > debug/logs_preview.txt
+
+          echo "=== Debug files ==="
+          ls -lah debug results logs
+
+      - name: Upload results and debug
         uses: actions/upload-artifact@v4
         with:
           name: nuclei-js-information-disclosure-results
           path: |
             nuclei_js_info_results.jsonl
-            results/
             js_final_clean.txt
+            results/
+            logs/
+            debug/
