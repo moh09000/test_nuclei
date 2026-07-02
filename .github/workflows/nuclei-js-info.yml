@@ -1,0 +1,94 @@
+name: Nuclei JS Information Disclosure
+
+on:
+  workflow_dispatch:
+
+jobs:
+  nuclei-js-info:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Nuclei
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq coreutils
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Update Nuclei templates
+        run: |
+          nuclei -update-templates
+
+      - name: Prepare JS URL chunks
+        run: |
+          mkdir -p chunks results
+
+          # clean file: remove empty lines, comments, spaces, duplicate URLs
+          grep -E '^https?://' js_final.txt \
+            | sed 's/[[:space:]]//g' \
+            | sort -u \
+            > js_final_clean.txt
+
+          echo "[+] Total JS URLs:"
+          wc -l js_final_clean.txt
+
+          # split every 1000 URLs into one chunk
+          split -l 1000 -d -a 4 js_final_clean.txt chunks/chunk_
+
+          echo "[+] Chunks:"
+          ls -lh chunks/
+
+      - name: Run Nuclei on JS URLs in parallel
+        run: |
+          export PATH="$HOME/go/bin:$PATH"
+
+          TPL="$HOME/nuclei-templates"
+          if [ -d "$HOME/.local/nuclei-templates" ]; then
+            TPL="$HOME/.local/nuclei-templates"
+          fi
+
+          run_chunk() {
+            chunk="$1"
+            base="$(basename "$chunk")"
+            echo "[+] Running nuclei on $base"
+
+            nuclei -l "$chunk" \
+              -t "$TPL/http/exposures/" \
+              -t "$TPL/http/misconfiguration/" \
+              -tags exposure,token,secret,secrets,config,disclosure,debug,env,api-key,apikey,credential,credentials \
+              -severity info,low,medium,high,critical \
+              -rl 50 \
+              -c 25 \
+              -retries 1 \
+              -timeout 10 \
+              -jsonl \
+              -silent \
+              -nc \
+              -o "results/${base}.jsonl" || true
+          }
+
+          export -f run_chunk
+          find chunks -type f | sort | xargs -P 6 -I{} bash -c 'run_chunk "$@"' _ {}
+
+      - name: Merge results
+        run: |
+          cat results/*.jsonl 2>/dev/null | sort -u > nuclei_js_info_results.jsonl || true
+
+          echo "[+] Total findings:"
+          wc -l nuclei_js_info_results.jsonl || true
+
+          echo "[+] Preview:"
+          head -30 nuclei_js_info_results.jsonl || true
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei-js-information-disclosure-results
+          path: |
+            nuclei_js_info_results.jsonl
+            results/
+            js_final_clean.txt
